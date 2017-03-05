@@ -4,29 +4,16 @@ View for Two Impurity Kondo model.
 
 from numpy import *
 from matplotlib.pyplot import *
-from scipy.linalg import eigvalsh
+from scipy.linalg import eigvalsh,eigh
 import pdb,time
 
-from tba.hgen import SpinSpaceConfig
+from tba.hgen import SpinSpaceConfig,quickload,quicksave
+from tba.hgen.multithreading import RANK,COMM,SIZE
 from dmrg import DMRGEngine,get_H_bm,get_H
-from rglib.hexpand import RGHGen,MaskedEvolutor,NullEvolutor,Evolutor
-from rglib.mps import MPS
 from nrg.binner import Binner
 from blockmatrix import eigbh
-from models import *
-
-def get_spec(h,nsite=10):
-    '''
-    Show the spectrum of heisenberg model.
-    '''
-    model=HeisenbergModel(J=1.,Jz=1.,h=h,nsite=nsite)
-    hgen=SpinHGen(spaceconfig=model.spaceconfig,evolutor=Evolutor(hndim=model.spaceconfig.hndim))
-    H,bm=get_H_bm(H=model.H_serial,hgen=hgen,bstr='M')
-    #get the Sz=0 block.
-    H0=bm.lextract_block(H,0.)
-    #Es,bm,H=eigbh(H0,return_evecs=False)
-    Es=eigvalsh(H0.toarray())
-    return Es
+from models import HeisenbergModel,random_config,solve1,get_width,solve_ed,ssf
+from pymps import get_expect,opunit_S
 
 def stat_E(h,nsite=10,nstat=10):
     '''
@@ -78,53 +65,106 @@ def stat_dEratio(h,nsite=10,nstat=10):
     plot(wlist,spec)
     pdb.set_trace()
 
+def show_ssf(hl,nsite,config1,config2):
+    '''ssf between two configures.'''
+    mps1=load_mps(hl,nsite,config1)[1]
+    mps2=load_mps(hl,nsite,config2)[1]
+    fl=ssf(mps1,mps2,'->')[0]
+    fr=ssf(mps1,mps2,'<-')[0]
+    sites=arange(nsite+1)
+    ion()
+    plot(sites,fl,color='k')
+    plot(sites,fr,color='k')
+    plot(sites[1:]-0.5,diff(fl),color='r')
+    plot(sites[1:]-0.5,-diff(fr),color='b')
+    legend([r'$[F^L]^2$',r'$[F^R]^2$'])
+    pdb.set_trace()
 
-def dmrgrun(model):
-    '''Get the result from DMRG'''
-    model=HeisenbergModel(J=J,Jz=Jz,h=h,nsite=nsite)
-    #run dmrg to get the initial guess.
-    hgen=RGHGen(spaceconfig=SpinSpaceConfig([2,1]),H=model.H_serial,evolutor_type='masked')
-    dmrgegn=DMRGEngine(hgen=hgen,tol=0,reflect=True)
-    dmrgegn.use_U1_symmetry('M',target_block=zeros(1))
-    EG,mps=dmrgegn.run_finite(endpoint=(5,'<-',0),maxN=30,tol=1e-12)
-    return EG,mps
+def len_stat_E(h,nsite,nsample=1000):
+    '''difference of characteristic length as a function of ds(E)'''
+    datas=[]
+    for i in xrange(nsample):
+        #generate two random initial config with random site different.
+        hl=(2*random.random(nsite)-1)*h
+        config0=random_config(nsite)
+        pos=random.randint(nsite)
+        config1=copy(config0)
+        config1[pos]=1-config0[pos]
 
-def solve1(h,nsite,config,Jz=1.,J=1.):
+        eng1,mps1,overlap1=solve1(hl,nsite,config=config0,Jz=1.,J=1.,save=False)
+        eng2,mps2,overlap2=solve1(hl,nsite,config=config1,Jz=1.,J=1.,save=False)
+        fl,profile=ssf(mps1,mps2,'->')
+        sigma=get_width(profile)
+        datas.append((pos,eng1,overlap1,eng2,overlap2,sigma))
+    f=open('data/len_stat_h%.2f.dat'%h,'a')
+    savetxt(f,datas)
+
+def retip_old(h,nsite):
+    '''difference of characteristic length as a function of ds(dE,dr)'''
+    #generate a random config
+    config0=random_config(nsite)
+    E1L,E2L,SL,RL=[],[],[],[]
+    for i in xrange(nsite):
+        if i==nsite/2: continue
+        config1=config0[:]
+        config1[i]=1-config0[i]
+        config2=config1[:]
+        config2[nsite/2]=1-config2[nsite/2]
+        eng1,mps1=solve1(h,nsite,config=config1,Jz=1.,J=1.,save=True)
+        eng2,mps2=solve1(h,nsite,config=config2,Jz=1.,J=1.,save=True)
+        #fr=(asarray(SSFLR([mps1,mps2],direction='<-'))**2)[::-1]
+        fl=asarray(SSFLR([mps1,mps2],direction='->'))**2
+        profile=diff(fl)
+        sigma=get_width(profile)
+        E1L.append(eng1)
+        E2L.append(eng2)
+        SL.append(sigma)
+        RL.append(i-nsite/2)
+    savetxt('data/')
+    ion()
+    plot(RL,SL)
+    pdb.set_trace()
+
+def measure_op(which,ket,usempi=False,ofile=None):
     '''
-    Run vMPS for Heisenberg model.
-    '''
-    #generate the model
-    if ndim(h)==0:
-        hl=cos(618*arange(nsite))*h
-    else:
-        hl=h
-    model=HeisenbergModel(J=J,Jz=Jz,h=hl,nsite=nsite)
+    Get order parameter from ground states.
 
-    #run vmps
-    #generate a random mps as initial vector
+    Parameters:
+        :which: str, 
+
+            * 'Sz', <Sz>
+        :siteindices: list, the measure points.
+
+    Return:
+        array, the value of order parameter.
+    '''
+    nsite=ket.nsite
     spaceconfig=SpinSpaceConfig([2,1])
-    bmg=SimpleBMG(spaceconfig=spaceconfig,qstring='M')
-    H=model.H.use_bm(bmg)
-    k0=product_state(config=config,hndim=2,bmg=bmg)
+    ml=[]
+    def measure1(siteindex):
+        if which=='Sz':
+            op=opunit_S(which='z',spaceconfig=spaceconfig,siteindex=siteindex)
+        else:
+            raise NotImplementedError()
+        m=get_expect(op,ket=ket).item() #,bra=ket.tobra(labels=ket.labels))
+        print 'Get %s for site %s = %s @RANK: %s'%(which,siteindex,m,RANK)
+        return m
 
-    #setting up the engine
-    vegn=VMPSEngine(H=H,k0=k0,eigen_solver='JD')
-    vegn.run(endpoint=(6,'->',0),maxN=50,which='SL',nsite_update=2)
-    ket=vegn.ket
-    filename='data/ket%s_h%sN%s.dat'%(''.join(config.astype(str)),h,nsite)
-    ket.save(filename)
+    if usempi:
+        ml=mpido(measure1,inputlist=siteindices)
+    else:
+        ml=[]
+        for siteindex in arange(nsite):
+            ml.append(measure1(siteindex))
+    ml=array(ml)
+    if RANK==0 and ofile is not None:
+        savetxt(ofile,ml.real)
+    return ml
 
-def load_mps(h,nsite,config):
-    '''Load a MPS'''
-    filename='data/ket%s_h%sN%s.dat'%(''.join(config.astype(str)),h,nsite)
-    return MPS.load(filename)
-
-def get_projector(h,nsite,c0,c1):
-    '''Generate a projection MPO from two kets.'''
-    k0=load_mps(h,nsite,c0)
-    k1=load_mps(h,nsite,c1)
-
-if __name__=='__main__':
-    TestVMPS().test_vmps()
-
-
+def show_sz(config,mps):
+    '''show the '''
+    ml1=measure_op('Sz',mps)
+    plot(ml1)
+    plot(-config+0.5)
+    legend(['Sz','Config'])
+    pdb.set_trace()
